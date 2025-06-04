@@ -1,0 +1,21 @@
+torch==2.7.0
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+sageattention==1.0.6
+
+git+https://github.com/Wan-Video/Wan2.1@main 
+
+diffusers>=0.33.0
+transformers>=4.49.0
+einops
+easydict
+
+# Для Celery + Redis-брокера
+celery[redis]
+
+# Для работы с видео и кадрами
+moviepy
+imageio-ffmpeg
+
+# Для обработки изображений (Pillow)
+Pillow
