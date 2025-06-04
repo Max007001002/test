@@ -22,5 +22,4 @@ VIDEO_DIR = "/app/videos"
 if not os.path.isdir(VIDEO_DIR):
     os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# Раздаём статику: GET /videos/{файл.mp4} → /app/videos/{файл.mp4}
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")

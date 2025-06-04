@@ -1,92 +1,60 @@
 # backend/app/worker.py
 import os
-import io
-import torch
-from PIL import Image
-from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
-from app.services.celery_app import celery_app  # при том, что в root`е есть папка app/
-import sageattention
-import teacache
-
-MODEL_DIR = os.getenv("WAN_MODEL_PATH", "/models/wan14B-720p")
-# Если вы хотите, чтобы модель автоматически скачивалась из HuggingFace на первом запуске,
-# MODEL_DIR можно не задавать, и внутри WanI2V.from_pretrained указывать название из репы.
-
-pipe = None
-
-def load_pipe():
-    """
-    Загружает WanI2V pipeline (fp16) с SageAttention и teacache.
-    Вызывается один раз (pipe=global).
-    """
-    global pipe
-    if pipe is None:
-        try:
-            from wan.image2video import WanI2V
-        except ImportError as e:
-            raise ImportError(f"WanI2V не найден: {e}")
-
-        # Загружаем в fp16 на CUDA
-        pipe = WanI2V.from_pretrained(
-            MODEL_DIR,
-            torch_dtype=torch.float16
-        ).to("cuda")
-
-        # Применяем ускорители
-        teacache.patch(pipe.unet)
-        sageattention.apply_sage_attention(pipe.unet, int8_kv=True)
-        try:
-            pipe.enable_attention_slicing()
-        except Exception:
-            pass
-
-        print("Пайплайн WanI2V загружен с SageAttention + teacache.")
-    return pipe
+import subprocess
+from celery import Celery
+from app.services.celery_app import celery_app  # убедитесь, что путь корректный
 
 @celery_app.task(name="generate_video_task_async", bind=True)
-def generate_video_task_async(self, job_id: str, img_bytes: bytes,
-                              prompt: str, neg_prompt: str,
-                              duration_sec: int, fps: int, num_inference_steps: int):
+def generate_video_task_async(self, job_id: str, filename: str, prompt: str):
     """
-    1. Декодируем img_bytes в PIL Image
-    2. Запускаем pipeline(img2video) → список numpy кадров [H,W,3]
-    3. Сохраняем mp4 через MoviePy в /app/videos/{job_id}.mp4
-    4. Возвращаем {"status":"success","output_path":"/app/videos/job_id.mp4"} или ошибку
+    Таска для генерации видео с помощью Wan 2.1 через скрипт generate.py.
+
+    Аргументы:
+      - job_id: уникальный идентификатор (UUID)
+      - filename: имя загруженного файла (например, "1234_myimage.png"), лежащего в /app/uploads
+      - prompt: текстовый prompt
+
+    Логика:
+      1) Формируем путь до входного изображения: /app/uploads/{filename}
+      2) Запускаем torchrun с 2 GPU внутри каталога /app/Wan2.1
+      3) Ждём завершения и проверяем returncode
+      4) Если всё успешно, ожидаем файл /app/videos/{job_id}.mp4
+      5) Возвращаем {"status":"success","output_path":"/app/videos/job_id.mp4"} или ошибку
     """
     try:
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        pipeline = load_pipe()
-        total_frames = duration_sec * fps
+        # 1) Пути и директории
+        uploads_dir = "/app/uploads"
+        videos_dir = "/app/videos"
+        ckpt_dir = "/app/Wan2.1-I2V-14B-720P"  # <-- здесь должны лежать чекпоинты (скачайте заранее!)
+        os.makedirs(videos_dir, exist_ok=True)
 
-        # Генерируем кадры (WanI2V API: img2video)
-        result = pipeline(
-            prompt=prompt,
-            negative_prompt=neg_prompt,
-            image=image,
-            num_inference_steps=num_inference_steps,
-            fps=fps,
-            frames=total_frames,
-            height=720,
-            width=1280,
-        )
-        try:
-            video_frames = result.videos  # если API вернул объект с .videos
-        except Exception:
-            video_frames = result  # если вернулся список напрямую
+        img_path = os.path.join(uploads_dir, filename)
+        out_name = f"{job_id}.mp4"
 
-        out_dir = "/app/videos"
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{job_id}.mp4")
+        # 2) Формируем команду torchrun
+        cmd = [
+            "torchrun",
+            "--nproc_per_node=2",       # запускаем на 2 GPU (Pro 6000 и Pro 6000)
+            "generate.py",
+            "--task", "i2v-14B",
+            "--size", "1280*720",
+            "--ckpt_dir", ckpt_dir,
+            "--image", img_path,
+            "--dit_fsdp",
+            "--t5_fsdp",
+            "--ulysses_size", "8",
+            "--prompt", prompt,
+            "--output_dir", videos_dir,
+            "--output_name", out_name
+        ]
 
-        clip = ImageSequenceClip(video_frames, fps=fps)
-        clip.write_videofile(
-            out_path,
-            codec="libx264",
-            preset="veryfast",
-            audio=False
-        )
-        return {"status": "success", "output_path": out_path}
+        # 3) Запускаем процесс внутри каталога /app/Wan2.1
+        result = subprocess.run(cmd, cwd="/app/Wan2.1", capture_output=True, text=True)
+        if result.returncode != 0:
+            # Если ошибка, возвращаем stderr
+            return {"status": "error", "message": result.stderr}
+
+        # 4) Вернём относительный путь до видео
+        return {"status": "success", "output_path": f"/app/videos/{out_name}"}
     except Exception as e:
-        msg = f"Ошибка при генерации видео: {e}"
-        print(msg)
-        return {"status": "error", "message": msg}
+        return {"status": "error", "message": str(e)}
